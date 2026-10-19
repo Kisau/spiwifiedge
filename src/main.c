@@ -9,6 +9,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/sys/ring_buffer.h>
 #include <unistd.h>
 
 LOG_MODULE_REGISTER(real_uart_camera_stream, LOG_LEVEL_DBG);
@@ -33,8 +34,8 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 #pragma pack(push, 1)
 struct frame_header {
     uint16_t magic_word;
-    uint32_t image_size;   // JPEG payload 的 byte 數
-    uint16_t box_count;    // 緊接在 header 後面的 bbox_data 筆數（0~10）
+    uint32_t image_size;
+    uint16_t box_count;
 };
 
 struct bbox_data {
@@ -47,11 +48,10 @@ struct bbox_data {
 };
 #pragma pack(pop)
 
-#define HEADER_MAX_BLOCK_SIZE (sizeof(struct frame_header) + 10 * sizeof(struct bbox_data))
-#define FRAME_BUF_SIZE 10240  // 與 H7 的 UART_TX_BUF_CAP 對齊
+#define FRAME_BUF_SIZE 8192
 
 // ==========================================
-// 🔧 雙緩衝 + Semaphore（加上 4-byte 對齊）
+// 🔧 應用層雙緩衝 + Semaphore
 // ==========================================
 #define NUM_RXBUFS 2
 static uint8_t frame_buf[NUM_RXBUFS][FRAME_BUF_SIZE] __aligned(4);
@@ -65,12 +65,23 @@ struct frame_msg {
 K_MSGQ_DEFINE(frame_ready_msgq, sizeof(struct frame_msg), NUM_RXBUFS, 4);
 
 // ==========================================
-// 📡 UART 接收狀態機（在 IRQ context 執行）
+// 🚀 DMA 與 Ring Buffer (保護資料不遺失)
+// ==========================================
+RING_BUF_DECLARE(uart_rb, 8192); // 8KB Ring Buffer
+K_SEM_DEFINE(rb_sem, 0, 1);       // 喚醒解析 Thread
+
+#define DMA_BUF_COUNT 4
+#define DMA_BUF_SIZE 1024
+static uint8_t dma_rx_buf[DMA_BUF_COUNT][DMA_BUF_SIZE];
+static volatile uint8_t next_dma_buf_idx = 1;
+
+// ==========================================
+// 📡 封包解析狀態機 (在獨立 Thread 執行)
 // ==========================================
 enum parse_state { ST_SYNC1, ST_SYNC2, ST_HEADER, ST_BOXES, ST_PAYLOAD };
 static enum parse_state pstate = ST_SYNC1;
-static uint32_t pcount;      // 目前這個 state 還需要幾個 byte
-static uint8_t *pdst;        // 下一個 byte 要寫去哪
+static uint32_t pcount;
+static uint8_t *pdst;
 static struct frame_header rx_header;
 
 static void parser_reset_from_error(void) {
@@ -83,14 +94,13 @@ static void parser_reset_from_error(void) {
 static void parser_feed(uint8_t b) {
     switch (pstate) {
     case ST_SYNC1:
-        // 0xAABB 小端序低位元組 0xBB 先出現
         if (b == 0xBB) pstate = ST_SYNC2;
         break;
 
     case ST_SYNC2:
         if (b == 0xAA) {
             if (k_sem_take(&buf_free_sem[active_idx], K_NO_WAIT) != 0) {
-                pstate = ST_SYNC1;
+                pstate = ST_SYNC1; 
                 break;
             }
             frame_buf[active_idx][0] = 0xBB;
@@ -111,9 +121,7 @@ static void parser_feed(uint8_t b) {
             uint32_t box_bytes = (uint32_t)rx_header.box_count * sizeof(struct bbox_data);
             uint32_t total_needed = sizeof(rx_header) + box_bytes + rx_header.image_size;
 
-            // 確保 image_size 至少 4 bytes（包含 SOI FF D8 與 EOI FF D9）
-            if (rx_header.box_count > 10 || rx_header.image_size < 4 ||
-                total_needed > FRAME_BUF_SIZE) {
+            if (rx_header.box_count > 10 || rx_header.image_size < 4 || total_needed > FRAME_BUF_SIZE) {
                 k_sem_give(&buf_free_sem[active_idx]);
                 pstate = ST_SYNC1;
                 break;
@@ -141,61 +149,99 @@ static void parser_feed(uint8_t b) {
     case ST_PAYLOAD:
         *pdst++ = b;
         pcount--;
-        if (pcount == 0) {
-            uint32_t box_bytes = (uint32_t)rx_header.box_count * sizeof(struct bbox_data);
-            uint32_t jpeg_offset = sizeof(rx_header) + box_bytes;
-            uint8_t *jpg = &frame_buf[active_idx][jpeg_offset];
-            uint32_t img_sz = rx_header.image_size;
 
-            // 🔧 關鍵修正：驗證 JPEG SOI (FF D8) 與 EOI (FF D9) 標記，攔截漏 byte 或假同步破圖
-            if (jpg[0] != 0xFF || jpg[1] != 0xD8 ||
-                jpg[img_sz - 2] != 0xFF || jpg[img_sz - 1] != 0xD9) {
+        uint32_t box_bytes = (uint32_t)rx_header.box_count * sizeof(struct bbox_data);
+        uint32_t jpeg_offset = sizeof(struct frame_header) + box_bytes;
+        uint32_t received_img_sz = (uint32_t)(pdst - &frame_buf[active_idx][jpeg_offset]);
+
+        // 🔧 動態偵測 FF D9 (解決 H7 Size 錯誤問題)
+        if (received_img_sz >= 2 && *(pdst - 2) == 0xFF && *(pdst - 1) == 0xD9) {
+            uint8_t *jpg = &frame_buf[active_idx][jpeg_offset];
+            
+            if (jpg[0] == 0xFF && jpg[1] == 0xD8) {
+                struct frame_header *hdr = (struct frame_header *)frame_buf[active_idx];
+                hdr->image_size = received_img_sz;
+
+                struct frame_msg m = {
+                    .idx = active_idx,
+                    .len = jpeg_offset + received_img_sz,
+                };
+                
+                if (k_msgq_put(&frame_ready_msgq, &m, K_NO_WAIT) != 0) {
+                    k_sem_give(&buf_free_sem[active_idx]);
+                }
+                
+                active_idx = (active_idx + 1) % NUM_RXBUFS;
+                pstate = ST_SYNC1;
+                break; 
+            } else {
                 k_sem_give(&buf_free_sem[active_idx]);
                 pstate = ST_SYNC1;
                 break;
             }
+        }
 
-            struct frame_msg m = {
-                .idx = active_idx,
-                .len = jpeg_offset + img_sz,
-            };
-            if (k_msgq_put(&frame_ready_msgq, &m, K_NO_WAIT) != 0) {
-                k_sem_give(&buf_free_sem[active_idx]);
-            }
-            active_idx = (active_idx + 1) % NUM_RXBUFS;
+        if (pcount == 0) {
+            k_sem_give(&buf_free_sem[active_idx]);
             pstate = ST_SYNC1;
         }
         break;
     }
 }
 
-static void uart_isr(const struct device *dev, void *user_data) {
-    ARG_UNUSED(user_data);
-    if (!uart_irq_update(dev)) return;
-
-    // 🔧 檢查硬體是否有 Overrun / Framing Error，若有掉 byte 則立即放棄當前破損幀
-    int err = uart_err_check(dev);
-    if (err > 0) {
-        parser_reset_from_error();
+// ==========================================
+// 🚀 背景解析 Thread
+// ==========================================
+void parser_thread(void *arg1, void *arg2, void *arg3) {
+    ARG_UNUSED(arg1); ARG_UNUSED(arg2); ARG_UNUSED(arg3);
+    uint8_t buf[512];
+    
+    while (1) {
+        k_sem_take(&rb_sem, K_FOREVER);
+        while (!ring_buf_is_empty(&uart_rb)) {
+            uint32_t len = ring_buf_get(&uart_rb, buf, sizeof(buf));
+            for (uint32_t i = 0; i < len; i++) {
+                parser_feed(buf[i]);
+            }
+        }
     }
+}
+K_THREAD_DEFINE(parser_tid, 2048, parser_thread, NULL, NULL, NULL, 5, 0, 0);
 
-    while (uart_irq_rx_ready(dev)) {
-        uint8_t byte;
-        int n = uart_fifo_read(dev, &byte, 1);
-        if (n != 1) break;
-        parser_feed(byte);
+// ==========================================
+// 🚀 UART Async API (DMA) 回呼函式
+// ==========================================
+static void uart_async_cb(const struct device *dev, struct uart_event *evt, void *user_data) {
+    switch (evt->type) {
+    case UART_RX_RDY:
+        // DMA 收到資料，以極速塞入 Ring Buffer，然後立刻退出
+        ring_buf_put(&uart_rb, &evt->data.rx.buf[evt->data.rx.offset], evt->data.rx.len);
+        k_sem_give(&rb_sem);
+        break;
+
+    case UART_RX_BUF_REQUEST:
+        uart_rx_buf_rsp(dev, dma_rx_buf[next_dma_buf_idx], DMA_BUF_SIZE);
+        next_dma_buf_idx = (next_dma_buf_idx + 1) % DMA_BUF_COUNT;
+        break;
+
+    case UART_RX_STOPPED:
+        parser_reset_from_error();
+        uart_rx_enable(dev, dma_rx_buf[next_dma_buf_idx], DMA_BUF_SIZE, SYS_FOREVER_US);
+        next_dma_buf_idx = (next_dma_buf_idx + 1) % DMA_BUF_COUNT;
+        break;
+
+    default:
+        break;
     }
 }
 
 static void wifi_event_handler(struct net_mgmt_event_callback *cb, uint64_t mgmt_event, struct net_if *iface) {
-    ARG_UNUSED(cb);
-    ARG_UNUSED(iface);
+    ARG_UNUSED(cb); ARG_UNUSED(iface);
     if (mgmt_event == NET_EVENT_WIFI_DISCONNECT_RESULT) l3_ready = false;
 }
 
 static void ipv4_event_handler(struct net_mgmt_event_callback *cb, uint64_t mgmt_event, struct net_if *iface) {
-    ARG_UNUSED(cb);
-    ARG_UNUSED(iface);
+    ARG_UNUSED(cb); ARG_UNUSED(iface);
     if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) l3_ready = true;
 }
 
@@ -231,10 +277,8 @@ int main(void)
     gpio_pin_set_dt(&led, 0);
 
     uart_dev = DEVICE_DT_GET(UART_DEV_NODE);
-    if (!device_is_ready(uart_dev)) {
-        LOG_ERR("UART not ready!");
-        return 0;
-    }
+    if (!device_is_ready(uart_dev)) return 0;
+
     struct uart_config ucfg = {
         .baudrate = UART_BAUDRATE,
         .parity = UART_CFG_PARITY_NONE,
@@ -242,24 +286,20 @@ int main(void)
         .data_bits = UART_CFG_DATA_BITS_8,
         .flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
     };
-    if (uart_configure(uart_dev, &ucfg) != 0) {
-        LOG_ERR("UART configure failed!");
-        return 0;
-    }
+    if (uart_configure(uart_dev, &ucfg) != 0) return 0;
 
     for (int i = 0; i < NUM_RXBUFS; i++) {
         k_sem_init(&buf_free_sem[i], 1, 1);
     }
 
-    uart_irq_callback_user_data_set(uart_dev, uart_isr, NULL);
-    uart_irq_rx_enable(uart_dev);
+    if (uart_callback_set(uart_dev, uart_async_cb, NULL) != 0) return 0;
+
+    if (uart_rx_enable(uart_dev, dma_rx_buf[0], DMA_BUF_SIZE, SYS_FOREVER_US) != 0) return 0;
 
     LOG_INF("等待 Wi-Fi 連線...");
-    if (setup_network() != 0) {
-        LOG_ERR("網路初始化失敗！");
-        return 0;
-    }
-    LOG_INF("Wi-Fi 連線成功！UART 接收已啟動，等待 H7 開始傳輸。");
+    if (setup_network() != 0) return 0;
+    
+    LOG_INF("Wi-Fi 連線成功！UART DMA 已在背景接收，等待 H7 傳輸。");
 
     while (1) {
         if (!l3_ready) {
@@ -275,7 +315,6 @@ int main(void)
                 continue;
             }
 
-            // 🔧 關鍵修正：設定 TCP 傳送逾時 (2 秒)，避免 Wi-Fi 瞬斷或 Server 當機時 send() 永久卡死
             struct zsock_timeval tv = { .tv_sec = 2, .tv_usec = 0 };
             setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -296,7 +335,6 @@ int main(void)
 
         gpio_pin_set_dt(&led, 1);
 
-        uint32_t send_start = k_uptime_get_32();
         uint8_t *fb = frame_buf[m.idx];
         uint32_t total_payload = m.len;
         uint32_t sent_bytes = 0;
@@ -308,17 +346,11 @@ int main(void)
 
         if (hdr->image_size >= 4) {
             LOG_INF(
-                "L4 JPEG size=%u | HEAD=%02X %02X %02X %02X | "
-                "TAIL=%02X %02X %02X %02X",
+                "L4 JPEG size=%u | HEAD=%02X %02X %02X %02X | TAIL=%02X %02X %02X %02X",
                 hdr->image_size,
-                jpeg[0],
-                jpeg[1],
-                jpeg[2],
-                jpeg[3],
-                jpeg[hdr->image_size - 4],
-                jpeg[hdr->image_size - 3],
-                jpeg[hdr->image_size - 2],
-                jpeg[hdr->image_size - 1]
+                jpeg[0], jpeg[1], jpeg[2], jpeg[3],
+                jpeg[hdr->image_size - 4], jpeg[hdr->image_size - 3],
+                jpeg[hdr->image_size - 2], jpeg[hdr->image_size - 1]
             );
         }
 
@@ -328,21 +360,15 @@ int main(void)
 
             int rc = send(sock, fb + sent_bytes, send_len, 0);
             if (rc <= 0) {
-                LOG_ERR("TCP 傳送失敗或逾時斷線 (rc=%d)！", rc);
+                LOG_ERR("TCP 傳送失敗斷線");
                 close(sock);
                 sock = -1;
                 break;
             }
             sent_bytes += (uint32_t)rc;
         }
-        uint32_t send_duration = k_uptime_get_32() - send_start;
 
-        LOG_INF(" Frame 轉發完成 -> Bytes: %u | TCP 傳輸: %u ms", total_payload, send_duration);
-        LOG_INF("RAW: %02X %02X", fb[0], fb[1]);
-
-        // 🔧 關鍵修正：確定所有對 fb 的讀取（包含 LOG_INF）都完成後，才釋放緩衝區給 UART ISR
         k_sem_give(&buf_free_sem[m.idx]);
-
         gpio_pin_set_dt(&led, 0);
     }
 }
