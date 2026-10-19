@@ -1,5 +1,20 @@
-/ {
-    chosen {
-        zephyr,sram = &sram2;
-    };
+#include <zephyr/dt-bindings/dma/stm32_dma.h>
+
+&dma1 {
+    status = "okay";
+};
+
+&dmamux1 {
+    status = "okay";
+};
+
+&uart4 {
+    status = "okay";
+    current-speed = <921600>;
+    pinctrl-0 = <&uart4_tx_pa0 &uart4_rx_pa1>;
+    pinctrl-names = "default";
+
+    dmas = <&dmamux1 0 30 (STM32_DMA_PERIPH_RX | STM32_DMA_PRIORITY_HIGH)>;
+    dma-names = "rx";
+
 };

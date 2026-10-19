@@ -1,0 +1,15 @@
+cat << 'EOF' > .gitignore
+# Zephyr & CMake 編譯暫存目錄
+build/
+twister-out/
+
+# 編輯器與 IDE 設定檔
+.vscode/
+.idea/
+*.swp
+*~
+
+# 系統檔案
+.DS_Store
+Thumbs.db
+EOF
